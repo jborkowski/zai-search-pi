@@ -117,7 +117,7 @@ class ZaiMcpClient {
     }
 
     // Extract session ID from response headers
-    const sessionId = response.headers.get("Mcp-Session-Id");
+    const sessionId = response.headers.get("mcp-session-id");
     if (!sessionId) {
       throw new Error("No Mcp-Session-Id header in response");
     }
@@ -142,7 +142,7 @@ class ZaiMcpClient {
         "Authorization": `Bearer ${this.apiKey}`,
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
-        "Mcp-Session-Id": this.sessionId!,
+        "mcp-session-id": this.sessionId!,
       },
       body: JSON.stringify({
         jsonrpc: "2.0",
