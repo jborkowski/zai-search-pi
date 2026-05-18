@@ -116,15 +116,13 @@ class ZaiMcpClient {
       throw new Error(`MCP initialization failed: ${response.status} ${response.statusText}`);
     }
 
-    // Extract session ID from response headers
+    // Extract session ID from response headers (optional — some stateless servers don't provide one)
     const sessionId = response.headers.get("mcp-session-id");
-    if (!sessionId) {
-      throw new Error("No Mcp-Session-Id header in response");
+    if (sessionId) {
+      this.sessionId = sessionId;
     }
 
-    this.sessionId = sessionId;
-
-    // Consume the SSE response body
+    // Consume the response body
     await response.text();
   }
 
@@ -136,14 +134,18 @@ class ZaiMcpClient {
       await this.initialize();
     }
 
+    const headers: Record<string, string> = {
+      "Authorization": `Bearer ${this.apiKey}`,
+      "Content-Type": "application/json",
+      "Accept": "application/json, text/event-stream",
+    };
+    if (this.sessionId) {
+      headers["mcp-session-id"] = this.sessionId;
+    }
+
     const response = await fetch(`${this.baseUrl}/mcp`, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-        "mcp-session-id": this.sessionId!,
-      },
+      headers,
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: ++this.requestId,
@@ -180,9 +182,10 @@ class ZaiMcpClient {
   }
 
   /**
-   * Parse Server-Sent Events format response
+   * Parse Server-Sent Events format or plain JSON response
    */
   private parseSseResponse(text: string): ZaiJsonRpcResponse {
+    // Try SSE format first (data: ...)
     const lines = text.split("\n");
     for (const line of lines) {
       if (line.startsWith("data:")) {
@@ -190,7 +193,12 @@ class ZaiMcpClient {
         return JSON.parse(dataStr) as ZaiJsonRpcResponse;
       }
     }
-    throw new Error("No data event found in SSE response");
+    // Fall back to plain JSON
+    try {
+      return JSON.parse(text) as ZaiJsonRpcResponse;
+    } catch {
+      throw new Error(`Unexpected response format: ${text.slice(0, 200)}`);
+    }
   }
 }
 
