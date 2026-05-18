@@ -1,0 +1,17 @@
+{
+  "$schema": "https://oxlint.com/schema.json",
+  "categories": {
+    "suspicious": "warn",
+    "correctness": "error",
+    "perf": "warn",
+    "style": "warn",
+    "restriction": "warn"
+  },
+  "target": "ES2022",
+  "env": {
+    "bun": true,
+    "node": true
+  },
+  "include": ["*.ts"],
+  "exclude": ["node_modules/**"]
+}
