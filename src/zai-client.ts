@@ -67,6 +67,63 @@ export function suspiciousKeyShape(key: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Minimal shape of pi-agent's modelRegistry that we depend on.
+ * Defined here to keep the auth-resolver decoupled from pi-coding-agent's types.
+ */
+export interface ModelRegistryLike {
+  getApiKeyForProvider(provider: string): Promise<string | undefined>;
+}
+
+/**
+ * Pi-agent context shape we depend on. Optional fields so we can be passed a
+ * partial context, undefined, or a full ExtensionContext interchangeably.
+ */
+export interface AuthContextLike {
+  modelRegistry?: ModelRegistryLike;
+}
+
+const ZAI_PROVIDER_ID = "zai";
+
+/**
+ * Ask pi-agent's modelRegistry for the Z AI key. Returns null if the registry
+ * is unavailable, throws, or yields a missing/empty value.
+ *
+ * This is the preferred path because it respects: CLI --api-key overrides,
+ * credential-protection plugins, OAuth refresh, and env-var fallbacks.
+ */
+export async function resolveKeyFromRegistry(ctx: AuthContextLike | undefined): Promise<string | null> {
+  try {
+    const key = await ctx?.modelRegistry?.getApiKeyForProvider?.(ZAI_PROVIDER_ID);
+    return typeof key === "string" && key.trim().length > 0 ? key.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the Z AI key from any available source.
+ *
+ * Order:
+ *   1. modelRegistry (respects pi-agent's full credential chain)
+ *   2. Direct fs read of ~/.pi/agent/auth.json (fallback for tests/older agents)
+ *
+ * Returns the trimmed key or a descriptive AuthError result describing why
+ * neither source produced one.
+ */
+export async function resolveZaiApiKey(
+  ctx?: AuthContextLike,
+  loader: () => Promise<{ ok: true; key: string } | { ok: false; error: AuthError }> = loadZaiApiKey,
+): Promise<{ ok: true; key: string; source: "registry" | "disk" } | { ok: false; error: AuthError }> {
+  const fromRegistry = await resolveKeyFromRegistry(ctx);
+  if (fromRegistry) return { ok: true, key: fromRegistry, source: "registry" };
+
+  const fromDisk = await loader();
+  if (fromDisk.ok) return { ok: true, key: fromDisk.key, source: "disk" };
+
+  return { ok: false, error: fromDisk.error };
+}
+
 export function describeAuthError(err: AuthError): string {
   switch (err.kind) {
     case "missing-file":

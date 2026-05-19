@@ -3,13 +3,16 @@
  *
  * Integrates Z AI's Web Search, Web Reader, and GitHub Reader / Zread as custom tools — all via MCP.
  *
- * Credentials are read from ~/.pi/agent/auth.json under "zai" -> "key".
+ * Credentials are resolved through pi-agent's modelRegistry (provider "zai"),
+ * which honors: CLI --api-key override → auth.json → env vars → fallback resolver.
+ * Falls back to direct fs read of ~/.pi/agent/auth.json when the registry has no
+ * entry, so the extension keeps working in older pi-agent versions / tests.
  *
  * The MCP client lives in src/zai-client.ts so it can be unit-tested in isolation.
  */
 
 import { Type, StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   truncateHead,
   formatSize,
@@ -20,8 +23,8 @@ import {
 import {
   ZaiMcpClient,
   ZaiMcpError,
-  loadZaiApiKey,
   describeAuthError,
+  resolveZaiApiKey,
   suspiciousKeyShape,
 } from "./src/zai-client";
 
@@ -49,13 +52,13 @@ function formatZaiError(toolLabel: string, err: unknown): Error {
 }
 
 /**
- * Loads the API key, returning the key or throwing a descriptive error.
- * One place for the credential check so all tools fail the same way.
+ * Resolve the Z AI API key (registry → fs fallback). Throws a descriptive
+ * Error if no key is available.
  */
-async function requireApiKey(): Promise<string> {
-  const result = await loadZaiApiKey();
-  if (!result.ok) throw new Error(describeAuthError(result.error));
-  return result.key;
+async function requireApiKey(ctx?: ExtensionContext): Promise<string> {
+  const r = await resolveZaiApiKey(ctx);
+  if (!r.ok) throw new Error(describeAuthError(r.error));
+  return r.key;
 }
 
 /** Build a tool result envelope with consistent truncation + details. */
@@ -99,7 +102,7 @@ const webSearchTool = {
     ),
   }),
 
-  async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
+  async execute(_toolCallId: string, params: unknown, signal: AbortSignal | undefined, _onUpdate: unknown, ctx?: ExtensionContext) {
     const args = params as {
       search_query: string;
       search_domain_filter?: string;
@@ -107,7 +110,7 @@ const webSearchTool = {
       content_size?: string;
       location?: string;
     };
-    const apiKey = await requireApiKey();
+    const apiKey = await requireApiKey(ctx);
     if (signal?.aborted) return toolResult("Search cancelled");
     const client = new ZaiMcpClient(apiKey, ENDPOINT.webSearch);
 
@@ -162,7 +165,7 @@ const webReaderTool = {
     with_links_summary: Type.Optional(Type.Boolean({ description: "Include link summaries (default: false)" })),
   }),
 
-  async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
+  async execute(_toolCallId: string, params: unknown, signal: AbortSignal | undefined, _onUpdate: unknown, ctx?: ExtensionContext) {
     const args = params as {
       url: string;
       timeout?: number;
@@ -174,7 +177,7 @@ const webReaderTool = {
       with_images_summary?: boolean;
       with_links_summary?: boolean;
     };
-    const apiKey = await requireApiKey();
+    const apiKey = await requireApiKey(ctx);
     if (signal?.aborted) return toolResult("Read cancelled");
     const client = new ZaiMcpClient(apiKey, ENDPOINT.webReader);
 
@@ -226,9 +229,9 @@ const githubSearchDocTool = {
     ),
   }),
 
-  async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
+  async execute(_toolCallId: string, params: unknown, signal: AbortSignal | undefined, _onUpdate: unknown, ctx?: ExtensionContext) {
     const args = params as { repo_name: string; query: string; language?: string };
-    const apiKey = await requireApiKey();
+    const apiKey = await requireApiKey(ctx);
     if (signal?.aborted) return toolResult("Search cancelled");
     const client = new ZaiMcpClient(apiKey, ENDPOINT.zread);
 
@@ -262,9 +265,9 @@ const githubReadFileTool = {
     file_path: Type.String({ description: "Relative path to the file in the repository (e.g., 'src/index.ts')" }),
   }),
 
-  async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
+  async execute(_toolCallId: string, params: unknown, signal: AbortSignal | undefined, _onUpdate: unknown, ctx?: ExtensionContext) {
     const args = params as { repo_name: string; file_path: string };
-    const apiKey = await requireApiKey();
+    const apiKey = await requireApiKey(ctx);
     if (signal?.aborted) return toolResult("Read cancelled");
     const client = new ZaiMcpClient(apiKey, ENDPOINT.zread);
 
@@ -298,9 +301,9 @@ const githubGetRepoStructureTool = {
     dir_path: Type.Optional(Type.String({ description: "Directory path (default: root '/')" })),
   }),
 
-  async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
+  async execute(_toolCallId: string, params: unknown, signal: AbortSignal | undefined, _onUpdate: unknown, ctx?: ExtensionContext) {
     const args = params as { repo_name: string; dir_path?: string };
-    const apiKey = await requireApiKey();
+    const apiKey = await requireApiKey(ctx);
     if (signal?.aborted) return toolResult("Structure lookup cancelled");
     const client = new ZaiMcpClient(apiKey, ENDPOINT.zread);
 
@@ -332,16 +335,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool(githubGetRepoStructureTool);
 
   pi.on("session_start", async (_event, ctx) => {
-    const result = await loadZaiApiKey();
-    if (!result.ok) {
-      ctx.ui.notify(`Z AI extension: ${describeAuthError(result.error)}`, "warning");
+    const r = await resolveZaiApiKey(ctx);
+    if (!r.ok) {
+      ctx.ui.notify(`Z AI extension: ${describeAuthError(r.error)}`, "warning");
       return;
     }
-    const suspicion = suspiciousKeyShape(result.key);
+    const suspicion = suspiciousKeyShape(r.key);
     if (suspicion) {
       ctx.ui.notify(`Z AI extension: API key looks malformed (${suspicion}). Tools will likely fail.`, "warning");
-    } else {
-      ctx.ui.notify("Z AI extension loaded with API key", "info");
     }
   });
 }

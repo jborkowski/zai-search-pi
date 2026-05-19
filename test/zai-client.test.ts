@@ -15,6 +15,8 @@ import {
   describeAuthError,
   loadZaiApiKey,
   parseMcpResponseBody,
+  resolveKeyFromRegistry,
+  resolveZaiApiKey,
   suspiciousKeyShape,
 } from "../src/zai-client";
 
@@ -415,6 +417,92 @@ describe("loadZaiApiKey", () => {
     expect(describeAuthError({ kind: "missing-key", path: "/p" })).toContain('"zai.key"');
     expect(describeAuthError({ kind: "empty-key", path: "/p" })).toContain("empty");
     expect(describeAuthError({ kind: "parse-error", path: "/p", cause: "x" })).toContain("not valid JSON");
+  });
+});
+
+describe("resolveKeyFromRegistry", () => {
+  it("returns the trimmed key when modelRegistry yields one", async () => {
+    const ctx = { modelRegistry: { getApiKeyForProvider: async () => "  abc123  " } };
+    expect(await resolveKeyFromRegistry(ctx)).toBe("abc123");
+  });
+
+  it("queries with the exact provider id 'zai'", async () => {
+    const seen: string[] = [];
+    const ctx = {
+      modelRegistry: {
+        getApiKeyForProvider: async (p: string) => {
+          seen.push(p);
+          return "abc";
+        },
+      },
+    };
+    await resolveKeyFromRegistry(ctx);
+    expect(seen).toEqual(["zai"]);
+  });
+
+  it("returns null when registry returns undefined", async () => {
+    const ctx = { modelRegistry: { getApiKeyForProvider: async () => undefined } };
+    expect(await resolveKeyFromRegistry(ctx)).toBeNull();
+  });
+
+  it("returns null when registry returns empty/whitespace string", async () => {
+    const ctx = { modelRegistry: { getApiKeyForProvider: async () => "   " } };
+    expect(await resolveKeyFromRegistry(ctx)).toBeNull();
+  });
+
+  it("swallows registry exceptions and returns null", async () => {
+    const ctx = { modelRegistry: { getApiKeyForProvider: async () => { throw new Error("boom"); } } };
+    expect(await resolveKeyFromRegistry(ctx)).toBeNull();
+  });
+
+  it("returns null when ctx, modelRegistry, or method is absent", async () => {
+    expect(await resolveKeyFromRegistry(undefined)).toBeNull();
+    expect(await resolveKeyFromRegistry({})).toBeNull();
+    expect(await resolveKeyFromRegistry({ modelRegistry: {} as never })).toBeNull();
+  });
+});
+
+describe("resolveZaiApiKey", () => {
+  const fakeOk = (k: string) => async () => ({ ok: true as const, key: k });
+  const fakeErr = async () => ({ ok: false as const, error: { kind: "missing-file" as const, path: "/fake" } });
+
+  it("prefers the registry over the fs fallback", async () => {
+    const ctx = { modelRegistry: { getApiKeyForProvider: async () => "from-registry" } };
+    const r = await resolveZaiApiKey(ctx, fakeOk("from-disk"));
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.key).toBe("from-registry");
+      expect(r.source).toBe("registry");
+    }
+  });
+
+  it("falls back to fs when the registry yields nothing", async () => {
+    const ctx = { modelRegistry: { getApiKeyForProvider: async () => undefined } };
+    const r = await resolveZaiApiKey(ctx, fakeOk("from-disk"));
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.key).toBe("from-disk");
+      expect(r.source).toBe("disk");
+    }
+  });
+
+  it("falls back to fs when ctx is undefined (tests, older agents)", async () => {
+    const r = await resolveZaiApiKey(undefined, fakeOk("from-disk"));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.source).toBe("disk");
+  });
+
+  it("returns the fs error when both sources fail", async () => {
+    const r = await resolveZaiApiKey(undefined, fakeErr);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error.kind).toBe("missing-file");
+  });
+
+  it("does not blow up if the registry throws", async () => {
+    const ctx = { modelRegistry: { getApiKeyForProvider: async () => { throw new Error("plugin denied"); } } };
+    const r = await resolveZaiApiKey(ctx, fakeOk("from-disk"));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.source).toBe("disk");
   });
 });
 
