@@ -1,8 +1,7 @@
 /**
  * Z AI Extension for pi-agent
  *
- * Integrates Z AI's Web Search, Web Reader (via REST API),
- * and GitHub Reader / Zread (via MCP) as custom tools.
+ * Integrates Z AI's Web Search, Web Reader, and GitHub Reader / Zread as custom tools — all via MCP.
  *
  * Credentials are read from ~/.pi/agent/auth.json under "zai" -> "key"
  */
@@ -24,45 +23,14 @@ interface ZaiAuthConfig {
   };
 }
 
-// --- REST API response types ---
+// --- MCP types ---
 
 interface WebSearchResult {
   title: string;
-  content: string;
   link: string;
-  media?: string;
-  icon?: string;
-  refer: string;
-  publish_date?: string;
-}
-
-interface WebSearchResponse {
-  id: string;
-  created: number;
-  search_result?: WebSearchResult[];
-  error?: { code: string; message: string };
-}
-
-interface ReaderResult {
-  title: string;
-  url: string;
   content: string;
-  description?: string;
-  metadata?: {
-    keywords?: string;
-    viewport?: string;
-    description?: string;
-  };
+  refer: string;
 }
-
-interface ReaderResponse {
-  id: string;
-  created: number;
-  reader_result?: ReaderResult;
-  error?: { code: string; message: string };
-}
-
-// --- MCP types (zread only) ---
 
 interface ZaiJsonRpcResponse {
   jsonrpc: "2.0";
@@ -110,57 +78,23 @@ function truncateOutput(output: string): string {
 }
 
 // ============================================================================
-// Z AI REST API Client (Web Search + Web Reader)
+// Z AI MCP Client
 // ============================================================================
 
-const ZAI_API_BASE = "https://api.z.ai/api";
-
-async function zaiRestFetch<T>(endpoint: string, body: unknown): Promise<T> {
-  const apiKey = await getZaiApiKey();
-  if (!apiKey) {
-    throw new Error("ZAI API key not found in ~/.pi/agent/auth.json under 'zai.key'");
-  }
-
-  const response = await fetch(`${ZAI_API_BASE}${endpoint}`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      "Accept-Language": "en-US,en",
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Z AI API error: ${response.status} ${response.statusText}`);
-  }
-
-  const data = (await response.json()) as T & { error?: { code: string; message: string } };
-
-  if (data.error) {
-    throw new Error(`Z AI API error ${data.error.code}: ${data.error.message}`);
-  }
-
-  return data;
-}
-
-// ============================================================================
-// Z AI MCP Client (zread / GitHub only)
-// ============================================================================
-
-class ZreadMcpClient {
+class ZaiMcpClient {
   private sessionId: string | null = null;
   private requestId = 0;
 
   constructor(
     private readonly apiKey: string,
+    private readonly baseUrl: string,
   ) {}
 
   /**
    * Initialize an MCP session with proper handshake
    */
   async initialize(): Promise<void> {
-    const response = await fetch("https://api.z.ai/api/mcp/zread/mcp", {
+    const response = await fetch(`${this.baseUrl}/mcp`, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${this.apiKey}`,
@@ -201,7 +135,7 @@ class ZreadMcpClient {
       headers["mcp-session-id"] = this.sessionId;
     }
 
-    await fetch("https://api.z.ai/api/mcp/zread/mcp", {
+    await fetch(`${this.baseUrl}/mcp`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -212,8 +146,8 @@ class ZreadMcpClient {
   }
 
   /**
-   * Call a tool on the zread MCP session.
-   * Handles double-encoded JSON from Z AI's MCP servers.
+   * Call a tool on the MCP session.
+   * Handles both single-encoded (zread markdown) and double-encoded (web_search/reader) JSON responses.
    */
   async callTool<T>(toolName: string, arguments_: unknown): Promise<T> {
     if (!this.sessionId) {
@@ -229,7 +163,7 @@ class ZreadMcpClient {
       headers["mcp-session-id"] = this.sessionId;
     }
 
-    const response = await fetch("https://api.z.ai/api/mcp/zread/mcp", {
+    const response = await fetch(`${this.baseUrl}/mcp`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -263,11 +197,17 @@ class ZreadMcpClient {
       throw new Error("No content in tool result");
     }
 
-    // Z AI MCP servers double-encode JSON: the text field is a JSON string containing another JSON string.
-    // Parse once, then if the result is still a string, parse again.
+    // Z AI MCP servers may double-encode JSON (web_search, web_reader)
+    // or single-encode (zread returns markdown strings).
+    // Parse once; if the result is a string, try parsing again.
+    // If the second parse fails, use the string as-is (zread markdown).
     let parsed: unknown = JSON.parse(resultText);
     if (typeof parsed === "string") {
-      parsed = JSON.parse(parsed);
+      try {
+        parsed = JSON.parse(parsed);
+      } catch {
+        // Single-encoded string (e.g. zread markdown) — keep as-is
+      }
     }
 
     return parsed as T;
@@ -293,7 +233,7 @@ class ZreadMcpClient {
 }
 
 // ============================================================================
-// Tool: Web Search (REST API)
+// Tool: Web Search (MCP)
 // Endpoint: POST /paas/v4/web_search
 // ============================================================================
 
@@ -329,6 +269,11 @@ const webSearchTool = {
   }),
 
   async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
+    const apiKey = await getZaiApiKey();
+    if (!apiKey) {
+      throw new Error("ZAI API key not found in ~/.pi/agent/auth.json under 'zai.key'");
+    }
+
     if (signal?.aborted) {
       return { content: [{ type: "text", text: "Search cancelled" }], details: {} };
     }
@@ -341,23 +286,21 @@ const webSearchTool = {
       location?: string;
     };
 
+    const client = new ZaiMcpClient(apiKey, "https://api.z.ai/api/mcp/web_search_prime");
+
     try {
-      const body: Record<string, unknown> = {
-        search_engine: "search-prime",
+      const results = await client.callTool<WebSearchResult[]>("web_search_prime", {
         search_query: args.search_query,
-      };
-      if (args.search_domain_filter) body.search_domain_filter = args.search_domain_filter;
-      if (args.search_recency_filter) body.search_recency_filter = args.search_recency_filter;
-
-      const response = await zaiRestFetch<WebSearchResponse>("/paas/v4/web_search", body);
-
-      const results = response.search_result ?? [];
+        ...(args.search_domain_filter && { search_domain_filter: args.search_domain_filter }),
+        ...(args.search_recency_filter && { search_recency_filter: args.search_recency_filter }),
+        ...(args.content_size && { content_size: args.content_size }),
+        ...(args.location && { location: args.location }),
+      });
 
       let output = `Found ${results.length} result(s) for "${args.search_query}":\n\n`;
       for (const [i, result] of results.entries()) {
         output += `${i + 1}. ${result.title}\n`;
         output += `   URL: ${result.link}\n`;
-        if (result.media) output += `   Source: ${result.media}\n`;
         output += `   ${result.content.slice(0, 200)}${result.content.length > 200 ? "..." : ""}\n\n`;
       }
 
@@ -374,8 +317,9 @@ const webSearchTool = {
 };
 
 // ============================================================================
-// Tool: Web Reader (REST API)
-// Endpoint: POST /paas/v4/reader
+// Tool: Web Reader (MCP)
+// Endpoint: https://api.z.ai/api/mcp/web_reader/mcp
+// Tool name: webReader
 // ============================================================================
 
 const webReaderTool = {
@@ -412,6 +356,11 @@ const webReaderTool = {
   }),
 
   async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
+    const apiKey = await getZaiApiKey();
+    if (!apiKey) {
+      throw new Error("ZAI API key not found in ~/.pi/agent/auth.json under 'zai.key'");
+    }
+
     if (signal?.aborted) {
       return { content: [{ type: "text", text: "Read cancelled" }], details: {} };
     }
@@ -428,28 +377,30 @@ const webReaderTool = {
       with_links_summary?: boolean;
     };
 
+    const client = new ZaiMcpClient(apiKey, "https://api.z.ai/api/mcp/web_reader");
+
     try {
-      const body: Record<string, unknown> = { url: args.url };
-      if (args.timeout !== undefined) body.timeout = args.timeout;
-      if (args.no_cache !== undefined) body.no_cache = args.no_cache;
-      if (args.return_format) body.return_format = args.return_format;
-      if (args.retain_images !== undefined) body.retain_images = args.retain_images;
-      if (args.no_gfm !== undefined) body.no_gfm = args.no_gfm;
-      if (args.keep_img_data_url !== undefined) body.keep_img_data_url = args.keep_img_data_url;
-      if (args.with_images_summary !== undefined) body.with_images_summary = args.with_images_summary;
-      if (args.with_links_summary !== undefined) body.with_links_summary = args.with_links_summary;
-
-      const response = await zaiRestFetch<ReaderResponse>("/paas/v4/reader", body);
-
-      const result = response.reader_result;
-      if (!result) {
-        throw new Error("No reader result in response");
-      }
+      const result = await client.callTool<{
+        title: string;
+        url: string;
+        content: string;
+        metadata?: { viewport?: string; lang?: string };
+      }>("webReader", {
+        url: args.url,
+        ...(args.timeout !== undefined && { timeout: args.timeout }),
+        ...(args.no_cache !== undefined && { no_cache: args.no_cache }),
+        ...(args.return_format && { return_format: args.return_format }),
+        ...(args.retain_images !== undefined && { retain_images: args.retain_images }),
+        ...(args.no_gfm !== undefined && { no_gfm: args.no_gfm }),
+        ...(args.keep_img_data_url !== undefined && { keep_img_data_url: args.keep_img_data_url }),
+        ...(args.with_images_summary !== undefined && { with_images_summary: args.with_images_summary }),
+        ...(args.with_links_summary !== undefined && { with_links_summary: args.with_links_summary }),
+      });
 
       let output = `Title: ${result.title}\n`;
       output += `URL: ${result.url}\n`;
-      if (result.description) output += `Description: ${result.description}\n`;
-      output += "\n---\n\n";
+      output += `Language: ${result.metadata?.lang ?? "unknown"}\n\n`;
+      output += "---\n\n";
       output += result.content;
 
       return {
@@ -504,7 +455,7 @@ const githubSearchDocTool = {
     }
 
     try {
-      const client = new ZreadMcpClient(apiKey);
+      const client = new ZaiMcpClient(apiKey, "https://api.z.ai/api/mcp/zread");
       const result = await client.callTool<Record<string, unknown>>("search_doc", {
         repo_name: args.repo_name,
         query: args.query,
@@ -562,7 +513,7 @@ const githubReadFileTool = {
     }
 
     try {
-      const client = new ZreadMcpClient(apiKey);
+      const client = new ZaiMcpClient(apiKey, "https://api.z.ai/api/mcp/zread");
       const result = await client.callTool<Record<string, unknown>>("read_file", {
         repo_name: args.repo_name,
         file_path: args.file_path,
@@ -620,7 +571,7 @@ const githubGetRepoStructureTool = {
     }
 
     try {
-      const client = new ZreadMcpClient(apiKey);
+      const client = new ZaiMcpClient(apiKey, "https://api.z.ai/api/mcp/zread");
       const result = await client.callTool<Record<string, unknown>>("get_repo_structure", {
         repo_name: args.repo_name,
         ...(args.dir_path !== undefined && { dir_path: args.dir_path }),
