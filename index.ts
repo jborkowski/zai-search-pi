@@ -94,7 +94,7 @@ class ZaiMcpClient {
    * Initialize an MCP session with proper handshake
    */
   async initialize(): Promise<void> {
-    const response = await fetch(`${this.baseUrl}/mcp`, {
+    const response = await fetch(`${this.baseUrl}`, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${this.apiKey}`,
@@ -135,7 +135,7 @@ class ZaiMcpClient {
       headers["mcp-session-id"] = this.sessionId;
     }
 
-    await fetch(`${this.baseUrl}/mcp`, {
+    await fetch(`${this.baseUrl}`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -163,7 +163,7 @@ class ZaiMcpClient {
       headers["mcp-session-id"] = this.sessionId;
     }
 
-    const response = await fetch(`${this.baseUrl}/mcp`, {
+    const response = await fetch(`${this.baseUrl}`, {
       method: "POST",
       headers,
       body: JSON.stringify({

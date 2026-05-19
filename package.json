@@ -1,6 +1,6 @@
 {
   "name": "zai-pi-extension",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Z AI integration for pi-agent - Web Search, Web Reader, and GitHub Reader",
   "type": "module",
   "main": "index.ts",
