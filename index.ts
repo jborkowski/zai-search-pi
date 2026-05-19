@@ -94,7 +94,7 @@ class ZaiMcpClient {
    * Initialize an MCP session with proper handshake
    */
   async initialize(): Promise<void> {
-    const response = await fetch(`${this.baseUrl}`, {
+    const response = await fetch(`${this.baseUrl}/mcp`, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${this.apiKey}`,
@@ -135,7 +135,7 @@ class ZaiMcpClient {
       headers["mcp-session-id"] = this.sessionId;
     }
 
-    await fetch(`${this.baseUrl}`, {
+    await fetch(`${this.baseUrl}/mcp`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -163,7 +163,7 @@ class ZaiMcpClient {
       headers["mcp-session-id"] = this.sessionId;
     }
 
-    const response = await fetch(`${this.baseUrl}`, {
+    const response = await fetch(`${this.baseUrl}/mcp`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -234,7 +234,6 @@ class ZaiMcpClient {
 
 // ============================================================================
 // Tool: Web Search (MCP)
-// Endpoint: POST /paas/v4/web_search
 // ============================================================================
 
 const webSearchTool = {
@@ -318,8 +317,6 @@ const webSearchTool = {
 
 // ============================================================================
 // Tool: Web Reader (MCP)
-// Endpoint: https://api.z.ai/api/mcp/web_reader/mcp
-// Tool name: webReader
 // ============================================================================
 
 const webReaderTool = {

@@ -6,3 +6,5 @@ node_modules/
 .env.*
 !.env.example
 dist/
+auth.json
+**/auth.json
