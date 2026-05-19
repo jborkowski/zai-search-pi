@@ -1,199 +1,157 @@
 /**
- * Comprehensive integration test for all 5 Z AI tools (MCP-based).
+ * Live integration test for all 5 Z AI tools (MCP-based).
  *
- * Usage: bun run test-integration.ts
+ *   bun run test-integration.ts
+ *
+ * Uses the same ZaiMcpClient as the extension itself — so this also smoke-tests
+ * the production code path. For pure unit tests, run `bun test`.
  */
 
-import { readFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
-
-// ── helpers ──────────────────────────────────────────────────────────────────
-
-async function getApiKey(): Promise<string> {
-  const authPath = join(homedir(), ".pi/agent/auth.json");
-  const raw = await readFile(authPath, "utf-8");
-  const auth = JSON.parse(raw);
-  const key = auth?.zai?.key;
-  if (!key) throw new Error("No ZAI API key in auth.json");
-  return key;
-}
-
-// ── MCP client ───────────────────────────────────────────────────────────────
-
-class ZaiMcpClient {
-  private sessionId: string | null = null;
-  private requestId = 0;
-
-  constructor(private readonly apiKey: string, private readonly baseUrl: string) {}
-
-  async initialize(): Promise<void> {
-    const res = await fetch(`${this.baseUrl}/mcp`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-        Accept: "application/json, text/event-stream",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0", id: ++this.requestId, method: "initialize",
-        params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "pi-test", version: "1" } },
-      }),
-    });
-    if (!res.ok) throw new Error(`MCP init failed: ${res.status}`);
-    this.sessionId = res.headers.get("mcp-session-id");
-    await res.text();
-    const headers: Record<string, string> = { Authorization: `Bearer ${this.apiKey}`, "Content-Type": "application/json" };
-    if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
-    await fetch(`${this.baseUrl}/mcp`, {
-      method: "POST", headers,
-      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
-    });
-  }
-
-  async callTool<T>(toolName: string, args: unknown): Promise<T> {
-    if (!this.sessionId) await this.initialize();
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.apiKey}`, "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-    };
-    if (this.sessionId) headers["mcp-session-id"] = this.sessionId;
-    const res = await fetch(`${this.baseUrl}/mcp`, {
-      method: "POST", headers,
-      body: JSON.stringify({ jsonrpc: "2.0", id: ++this.requestId, method: "tools/call", params: { name: toolName, arguments: args } }),
-    });
-    if (!res.ok) throw new Error(`Tool call failed: ${res.status}`);
-    const text = await res.text();
-    let json: { result?: { content?: Array<{ text: string }>; isError?: boolean }; error?: { message: string } };
-    const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-    json = dataLine ? JSON.parse(dataLine.slice(5).trim()) : JSON.parse(text);
-    if (!json.result) throw new Error(json.error?.message ?? "No result");
-    if (json.result.isError) throw new Error(`Tool error: ${json.result.content?.[0]?.text ?? ""}`);
-    const resultText = json.result.content?.[0]?.text;
-    if (!resultText) throw new Error("No content");
-    let parsed: unknown = JSON.parse(resultText);
-    if (typeof parsed === "string") { try { parsed = JSON.parse(parsed); } catch { /* single-encoded */ } }
-    return parsed as T;
-  }
-}
+import { loadZaiApiKey, describeAuthError, ZaiMcpClient, ZaiMcpError } from "./src/zai-client";
 
 // ── test runner ──────────────────────────────────────────────────────────────
 
 const failed: string[] = [];
+let passed = 0;
+
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
   process.stdout.write(`  ${name} ... `);
-  try { await fn(); console.log("✅ PASS"); }
-  catch (err) { console.log("❌ FAIL"); console.log(`       ${err instanceof Error ? err.message : String(err)}`); failed.push(name); }
+  try {
+    await fn();
+    passed++;
+    console.log("✅ PASS");
+  } catch (err) {
+    failed.push(name);
+    console.log("❌ FAIL");
+    const msg = err instanceof ZaiMcpError ? `[${err.kind}] ${err.message}` : err instanceof Error ? err.message : String(err);
+    console.log(`       ${msg}`);
+  }
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log("Z AI Extension — Integration Test Suite (MCP)\n");
-  const apiKey = await getApiKey();
+  console.log("Z AI Extension — Integration Test Suite (live network)\n");
 
-  const searchMcp = new ZaiMcpClient(apiKey, "https://api.z.ai/api/mcp/web_search_prime");
-  await searchMcp.initialize();
-  console.log("  web_search_prime ✅\n");
+  const auth = await loadZaiApiKey();
+  if (!auth.ok) {
+    console.error(`✗ ${describeAuthError(auth.error)}`);
+    process.exit(2);
+  }
+  const apiKey = auth.key;
+  console.log(`  auth: loaded key (len=${apiKey.length})\n`);
 
-  const readerMcp = new ZaiMcpClient(apiKey, "https://api.z.ai/api/mcp/web_reader");
-  await readerMcp.initialize();
-  console.log("  web_reader ✅\n");
+  const search = new ZaiMcpClient(apiKey, "https://api.z.ai/api/mcp/web_search_prime");
+  const reader = new ZaiMcpClient(apiKey, "https://api.z.ai/api/mcp/web_reader");
+  const zread = new ZaiMcpClient(apiKey, "https://api.z.ai/api/mcp/zread");
 
-  const zreadMcp = new ZaiMcpClient(apiKey, "https://api.z.ai/api/mcp/zread");
-  await zreadMcp.initialize();
-  console.log("  zread ✅\n");
+  // Force-initialize and report handshake status up front so a bad key fails
+  // before we burn time on tool calls.
+  await test("handshake: web_search_prime", () => search.initialize());
+  await test("handshake: web_reader", () => reader.initialize());
+  await test("handshake: zread", () => zread.initialize());
 
-  // ── 1. zai_web_search ──────────────────────────────────────────────────
+  // ── zai_web_search ─────────────────────────────────────────────────────────
 
-  await test("web_search (basic query)", async () => {
-    const results = await searchMcp.callTool<Array<{ title: string; link: string; content: string }>>(
-      "web_search_prime", { search_query: "Nicolaus Copernicus", location: "us" },
-    );
-    if (!Array.isArray(results) || results.length === 0) throw new Error("No results");
-    if (!results[0].content.includes("Copernicus")) throw new Error("Results don't match query");
-    console.log(`→ ${results.length} results, top: "${results[0].title}"`);
-  });
-
-  await test("web_search (recency filter)", async () => {
-    const results = await searchMcp.callTool<Array<{ title: string }>>(
-      "web_search_prime", { search_query: "AI news", search_recency_filter: "oneDay", location: "us" },
-    );
-    if (!Array.isArray(results)) throw new Error("No results for recent news");
-    console.log(`→ ${results.length} results with oneDay filter`);
-  });
-
-  await test("web_search (content_size=high)", async () => {
-    const results = await searchMcp.callTool<Array<{ content: string }>>(
-      "web_search_prime", { search_query: "Nicolaus Copernicus biography", content_size: "high", location: "us" },
-    );
-    const avgLen = results.reduce((s, r) => s + r.content.length, 0) / results.length;
-    console.log(`→ avg content: ${Math.round(avgLen)} chars`);
-  });
-
-  // ── 2. zai_web_reader ──────────────────────────────────────────────────
-
-  await test("web_reader (markdown)", async () => {
-    const result = await readerMcp.callTool<{ title: string; content: string }>(
-      "webReader", { url: "https://en.wikipedia.org/wiki/Nicolaus_Copernicus", return_format: "markdown", timeout: 30 },
-    );
-    if (!result.content.includes("Copernicus")) throw new Error("Missing expected content");
-    console.log(`→ "${result.title}" — ${result.content.length} chars`);
-  });
-
-  await test("web_reader (plain text)", async () => {
-    const result = await readerMcp.callTool<{ title: string; content: string }>(
-      "webReader", { url: "https://example.com", return_format: "text", timeout: 15 },
-    );
-    if (!result.title) throw new Error("No title");
-    console.log(`→ "${result.title}" — ${result.content.length} chars`);
-  });
-
-  // ── 3. zai_github_search ───────────────────────────────────────────────
-
-  await test("github_search (zread)", async () => {
-    const res = await zreadMcp.callTool<unknown>("search_doc", {
-      repo_name: "vitejs/vite", query: "HMR", language: "en",
+  await test("web_search: basic query returns results matching topic", async () => {
+    const results = await search.callTool<Array<{ title: string; link: string; content: string }>>("web_search_prime", {
+      search_query: "Nicolaus Copernicus", location: "us",
     });
-    const s = typeof res === "string" ? res : JSON.stringify(res);
-    if (!s.includes("HMR")) throw new Error("Missing HMR in results");
-    console.log(`→ ${s.length} chars`);
+    if (!Array.isArray(results) || results.length === 0) throw new Error("no results");
+    if (!results.some((r) => /Copernicus/i.test(r.content + r.title))) throw new Error("results unrelated to query");
+    console.log(`       → ${results.length} results, top: "${results[0].title}"`);
   });
 
-  // ── 4. zai_github_read_file ────────────────────────────────────────────
-
-  await test("github_read_file (zread)", async () => {
-    const res = await zreadMcp.callTool<unknown>("read_file", {
-      repo_name: "vitejs/vite", file_path: "README.md",
+  await test("web_search: recency filter accepted", async () => {
+    const results = await search.callTool<Array<{ title: string }>>("web_search_prime", {
+      search_query: "AI news", search_recency_filter: "oneDay", location: "us",
     });
-    const s = typeof res === "string" ? res : JSON.stringify(res);
-    if (!s.includes("Vite")) throw new Error("Missing Vite in file");
-    console.log(`→ ${s.length} chars`);
+    if (!Array.isArray(results)) throw new Error("unexpected shape");
+    console.log(`       → ${results.length} results`);
   });
 
-  // ── 5. zai_github_structure ────────────────────────────────────────────
-
-  await test("github_structure root (zread)", async () => {
-    const res = await zreadMcp.callTool<unknown>("get_repo_structure", { repo_name: "vitejs/vite" });
-    const s = typeof res === "string" ? res : JSON.stringify(res);
-    if (!s.includes("packages")) throw new Error("Missing packages dir");
-    console.log(`→ ${s.length} chars`);
-  });
-
-  await test("github_structure subdir (zread)", async () => {
-    const res = await zreadMcp.callTool<unknown>("get_repo_structure", {
-      repo_name: "vitejs/vite", dir_path: "packages",
+  await test("web_search: content_size=high returns longer content", async () => {
+    const results = await search.callTool<Array<{ content: string }>>("web_search_prime", {
+      search_query: "Nicolaus Copernicus biography", content_size: "high", location: "us",
     });
-    const s = typeof res === "string" ? res : JSON.stringify(res);
-    if (!s.includes("vite")) throw new Error("Missing vite package");
-    console.log(`→ ${s.length} chars`);
+    if (results.length === 0) throw new Error("no results");
+    const avgLen = Math.round(results.reduce((s, r) => s + r.content.length, 0) / results.length);
+    console.log(`       → avg content: ${avgLen} chars`);
   });
 
-  // ── results ────────────────────────────────────────────────────────────
+  // ── zai_web_reader ─────────────────────────────────────────────────────────
 
+  await test("web_reader: markdown fetches Wikipedia page", async () => {
+    const r = await reader.callTool<{ title: string; content: string }>("webReader", {
+      url: "https://en.wikipedia.org/wiki/Nicolaus_Copernicus", return_format: "markdown", timeout: 30,
+    });
+    if (!r.content.includes("Copernicus")) throw new Error("missing expected content");
+    console.log(`       → "${r.title}" — ${r.content.length} chars`);
+  });
+
+  await test("web_reader: plain text returns title", async () => {
+    const r = await reader.callTool<{ title: string; content: string }>("webReader", {
+      url: "https://example.com", return_format: "text", timeout: 15,
+    });
+    if (!r.title) throw new Error("no title");
+    console.log(`       → "${r.title}" — ${r.content.length} chars`);
+  });
+
+  // ── zai_github_search ──────────────────────────────────────────────────────
+
+  await test("github_search: returns HMR docs for vitejs/vite", async () => {
+    const res = await zread.callTool<unknown>("search_doc", { repo_name: "vitejs/vite", query: "HMR", language: "en" });
+    const s = typeof res === "string" ? res : JSON.stringify(res);
+    if (!s.includes("HMR")) throw new Error("missing HMR");
+    console.log(`       → ${s.length} chars`);
+  });
+
+  // ── zai_github_read_file ───────────────────────────────────────────────────
+
+  await test("github_read_file: README mentions Vite", async () => {
+    const res = await zread.callTool<unknown>("read_file", { repo_name: "vitejs/vite", file_path: "README.md" });
+    const s = typeof res === "string" ? res : JSON.stringify(res);
+    if (!s.includes("Vite")) throw new Error("missing Vite");
+    console.log(`       → ${s.length} chars`);
+  });
+
+  // ── zai_github_structure ───────────────────────────────────────────────────
+
+  await test("github_structure: root has 'packages' dir", async () => {
+    const res = await zread.callTool<unknown>("get_repo_structure", { repo_name: "vitejs/vite" });
+    const s = typeof res === "string" ? res : JSON.stringify(res);
+    if (!s.includes("packages")) throw new Error("missing packages");
+    console.log(`       → ${s.length} chars`);
+  });
+
+  await test("github_structure: subdir has 'vite' package", async () => {
+    const res = await zread.callTool<unknown>("get_repo_structure", { repo_name: "vitejs/vite", dir_path: "packages" });
+    const s = typeof res === "string" ? res : JSON.stringify(res);
+    if (!s.includes("vite")) throw new Error("missing vite");
+    console.log(`       → ${s.length} chars`);
+  });
+
+  // ── error-handling smoke tests (negative paths) ────────────────────────────
+
+  await test("error: wrong API key surfaces gateway-auth (not silent success)", async () => {
+    const bad = new ZaiMcpClient("definitely-not-a-real-key", "https://api.z.ai/api/mcp/web_search_prime", { maxRetries: 0 });
+    try {
+      await bad.callTool("web_search_prime", { search_query: "x" });
+      throw new Error("expected failure");
+    } catch (e) {
+      if (!(e instanceof ZaiMcpError)) throw e;
+      if (e.kind !== "gateway-auth" && e.kind !== "tool-error" && e.kind !== "init-failed") {
+        throw new Error(`expected gateway-auth/tool-error/init-failed, got ${e.kind}`);
+      }
+      console.log(`       → ${e.kind}: ${e.message.slice(0, 80)}`);
+    }
+  });
+
+  // ── results ────────────────────────────────────────────────────────────────
+
+  const total = passed + failed.length;
   console.log(`\n${"─".repeat(60)}`);
-  const passed = 9 - failed.length;
-  console.log(`Results: ${passed}/9 passed`);
+  console.log(`Results: ${passed}/${total} passed`);
   if (failed.length) {
     for (const f of failed) console.log(`  ❌ ${f}`);
     process.exit(1);
@@ -201,4 +159,7 @@ async function main() {
   console.log("All tests passed! ✅");
 }
 
-main().catch((err) => { console.error("Fatal:", err); process.exit(1); });
+main().catch((err) => {
+  console.error("Fatal:", err);
+  process.exit(1);
+});
